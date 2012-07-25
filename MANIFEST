@@ -1,0 +1,7 @@
+Changes
+Makefile.PL
+MANIFEST
+README
+t/AnyEvent-Redis-Federated.t
+lib/AnyEvent/Redis/Federated.pm
+META.yml                                 Module meta-data (added by MakeMaker)
