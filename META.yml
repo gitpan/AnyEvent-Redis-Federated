@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                AnyEvent-Redis-Federated
-version:             0.04
+version:             0.05
 abstract:            Full-featured Async Perl Redis client
 license:             ~
 author:              
@@ -9,6 +9,7 @@ generated_by:        ExtUtils::MakeMaker version 6.42
 distribution_type:   module
 requires:     
     AnyEvent::Redis:               0
+    Set::ConsistentHash:           0
     Test::More:                    0
     Test::TCP:                     0
 meta-spec:
