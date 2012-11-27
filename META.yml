@@ -1,25 +1,18 @@
----
-abstract: 'Full-featured Async Perl Redis client'
-author:
-  - 'jzawodn <jzawodn@craigslist.org>'
-build_requires:
-  ExtUtils::MakeMaker: 0
-configure_requires:
-  ExtUtils::MakeMaker: 0
-dynamic_config: 1
-generated_by: 'ExtUtils::MakeMaker version 6.62, CPAN::Meta::Converter version 2.112150'
-license: unknown
+--- #YAML:1.0
+name:                AnyEvent-Redis-Federated
+version:             0.08
+abstract:            Full-featured Async Perl Redis client
+license:             ~
+author:              
+    - jzawodn <jzawodn@craigslist.org>
+generated_by:        ExtUtils::MakeMaker version 6.42
+distribution_type:   module
+requires:     
+    AnyEvent::Redis:               0
+    Memory::Usage:                 0
+    Set::ConsistentHash:           0
+    Test::More:                    0
+    Test::TCP:                     0
 meta-spec:
-  url: http://module-build.sourceforge.net/META-spec-v1.4.html
-  version: 1.4
-name: AnyEvent-Redis-Federated
-no_index:
-  directory:
-    - t
-    - inc
-requires:
-  AnyEvent::Redis: 0
-  Set::ConsistentHash: 0
-  Test::More: 0
-  Test::TCP: 0
-version: 0.06
+    url:     http://module-build.sourceforge.net/META-spec-v1.3.html
+    version: 1.3

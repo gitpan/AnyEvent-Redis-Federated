@@ -1,5 +1,5 @@
-AnyEvent-Redis-Federated version 0.01
-=====================================
+AnyEvent-Redis-Federated version
+================================
 
 AnyEvent based async Redis client which implements  timeouts,
 connection retries, multi-machine pool configuration (including
@@ -26,7 +26,7 @@ This module requires these other modules and libraries:
 
 COPYRIGHT AND LICENCE
 
-Copyright (C) 2011 by craigslist.org
+Copyright (C) 2011-2012 by craigslist.org
 
 This library is free software; you can redistribute it and/or modify
 it under the same terms as Perl itself, either Perl version 5.10.1 or,

@@ -11,8 +11,9 @@ use AnyEvent;
 use Set::ConsistentHash;   # for hash ring logic
 use Digest::MD5 qw(md5);   # for hashing keys
 use Scalar::Util qw(weaken);
+use List::Util qw(shuffle);
 
-our $VERSION = "0.06";
+our $VERSION = "0.08";
 
 # keep a global object cache that will contain weak references to
 # objects keyed on their tag.  this allows for sharing of objects
@@ -31,17 +32,21 @@ our %object_cache;
 # failure and pretend things are just fine.
 
 use constant MAX_HOST_RETRIES      =>   3; # how many in a row before we pass
-use constant BASE_RETRY_INTERVAL   =>  10; # in seconds
+use constant BASE_RETRY_INTERVAL   =>   2; # in seconds
 use constant RETRY_INTERVAL_MULT   =>   2; # multiply this much each retry fail
-use constant RETRY_SLOP_SECS       =>   5; # see perldoc for this one
 use constant MAX_RETRY_INTERVAL    => 600; # no more than this long
-use constant DEFAULT_WEIGHT        => 10;  # for consistent hashing
-use constant COMMAND_TIMEOUT       =>  1;  # used in poll()
+use constant DEFAULT_WEIGHT        =>  10; # for consistent hashing
+use constant COMMAND_TIMEOUT       =>   1; # used in poll()
+use constant QUERY_ALL             =>   0; # don't query all addresses by default
 
-my %timeout_override = (
-	'blpop'     => 1, # means the timeout is in the command
-	'brpop'     => 1,
-	'subscribe' => 0, # means no timeout
+my %defaults = (
+	command_timeout     => COMMAND_TIMEOUT,
+	max_host_retries    => MAX_HOST_RETRIES,
+	base_retry_interval => BASE_RETRY_INTERVAL,
+	retry_interval_mult => RETRY_INTERVAL_MULT,
+	max_retry_interval  => MAX_RETRY_INTERVAL,
+	query_all           => QUERY_ALL,
+	quiet               => $ENV{QUIET},
 );
 
 sub new {
@@ -56,12 +61,10 @@ sub new {
 	}
 
 	# basic init
-	$self->{command_timeout}     ||= COMMAND_TIMEOUT;
-	$self->{max_host_retries}    ||= MAX_HOST_RETRIES;
-	$self->{base_retry_interval} ||= BASE_RETRY_INTERVAL;
-	$self->{retry_interval_mult} ||= RETRY_INTERVAL_MULT;
-	$self->{retry_slop_secs}     ||= RETRY_SLOP_SECS;
-	$self->{max_retry_interval}  ||= MAX_RETRY_INTERVAL;
+	while (my ($k, $v) = each %defaults) {
+		next if exists $self->{$k};
+		$self->{$k} = $v;
+	}
 
 	# condvar for finishing up stuff (used in poll())
 	$self->{cv} = undef;
@@ -84,6 +87,16 @@ sub new {
 	if ($self->{debug}) {
 		print "node list: ", join ', ', @{$self->{nodes}};
 		print "\n";
+	}
+
+	# setup the addresses array
+	foreach my $node (keys %{$self->{config}->{nodes}}) {
+		if ($self->{config}->{nodes}->{$node}->{addresses}) {
+			# shuffle the existing addresses array
+			@{$self->{config}->{nodes}->{$node}->{addresses}} = shuffle(@{$self->{config}->{nodes}->{$node}->{addresses}});
+			# and set the first to be our targeted server
+			$self->{config}->{nodes}->{$node}->{address} = ${$self->{config}->{nodes}->{$node}->{addresses}}[-1];
+		}
 	}
 
 	# setup the consistent hash
@@ -136,21 +149,29 @@ sub commandTimeout {
 	return $self->{command_timeout};
 }
 
+sub queryAll {
+	my ($self, $val) = @_;
+	if (defined $val) {
+		$self->{query_all} = $val;
+	}
+	return $self->{query_all};
+}
+
 sub nodeToHost {
 	my ($self, $node) = @_;
 	return $self->{config}->{nodes}->{$node}->{address};
 }
 
-sub keyToServer {
+sub keyToNode {
 	my ($self, $key) = @_;
 	my $node = $self->{buckets}->[_hash($key) % 1024];
-	return $self->nodeToHost($node);
+	return $node;
 }
 
 sub isServerDown {
 	my ($self, $server) = @_;
 	return 1 if $self->{server_status}{"$server:down"};
-	return 0;
+ 	return 0;
 }
 
 sub isServerUp {
@@ -159,76 +180,95 @@ sub isServerUp {
 	return 1;
 }
 
+sub nextServer {
+	my ($self, $server, $node) = @_;
+	return $server unless $self->{config}->{nodes}->{$node}->{addresses};
+	$self->{config}->{nodes}->{$node}->{address} = shift(@{$self->{config}->{nodes}->{$node}->{addresses}});
+	push @{$self->{config}->{nodes}->{$node}->{addresses}}, $self->{config}->{nodes}->{$node}->{address};
+	warn "redis server for $node changed from $server to $self->{config}->{nodes}->{$node}->{address} selected\n" if $self->{debug};
+	return $self->{config}->{nodes}->{$node}->{address};
+}
+
+## return only on-line/up servers?
+
+sub allServers {
+	my ($self, $node) = @_;
+	my $hosts = [ grep { $self->isServerUp($_) } @{$self->{config}->{nodes}->{$node}->{addresses}} ];
+	return $hosts;
+}
+
 sub markServerUp {
 	my ($self, $server) = @_;
 	if ($self->{server_status}{"$server:down"}) {
 		my $down_since = localtime($self->{server_status}{"$server:down_since"});
 		delete $self->{server_status}{"$server:down"};
 		delete $self->{server_status}{"$server:retries"};
-		delete $self->{server_status}{"$server:last_try"};
 		delete $self->{server_status}{"$server:down_since"};
+		delete $self->{server_status}{"$server:retry_pending"};
 		delete $self->{server_status}{"$server:retry_interval"};
- 		warn "redis server $server back up (down since $down_since)\n";
+ 		warn "redis server $server back up (down since $down_since)\n" if $self->{debug};
 	}
 	return 1;
 }
 
 sub markServerDown {
-	my ($self, $server) = @_;
-	warn "redis server $server seems down\n";
+	my ($self, $server, $delay) = @_;
+	$delay ||= $self->{base_retry_interval};
+	warn "redis server $server seems down\n" if $self->{debug};
 
 	# first time?
 	if (not $self->{server_status}{"$server:down"}) {
-		warn "server $server down, first time\n";
+		warn "server $server down, first time\n" if $self->{debug};
 		$self->{server_status}{"$server:down"} = 1;
 		$self->{server_status}{"$server:retries"}++;
-		$self->{server_status}{"$server:last_try"} = time();
 		$self->{server_status}{"$server:down_since"} = time();
 		$self->{server_status}{"$server:retry_interval"} ||= $self->{base_retry_interval};
 	}
 
-	# repeat
-	else {
-		$self->{server_status}{"$server:retries"}++;
-		$self->{server_status}{"$server:last_try"} = time();
-
-		if ($self->{server_status}{"$server:retries"} == $self->{max_host_retries}) {
-			warn "redis server $server still down, backing off\n";
-		}
-
-		# are we in back off-mode yet?
-		elsif ($self->{server_status}{"$server:retries"} > $self->{max_host_retries}) {
-
-			# can we back off more?
-			if ($self->{server_status}{"$server:retry_interval"} < $self->{max_retry_interval}) {
-				$self->{server_status}{"$server:retry_interval"} *= $self->{retry_interval_mult};
-				$self->{server_status}{"$server:retry_interval"} += int(rand($self->{retry_slop_secs}));
-				my $int = $self->{server_status}{"$server:retry_interval"};
-				warn "retry_interval for $server now $int\n";
-			}
-		}
+	if ($self->{server_status}{"$server:retry_pending"}) {
+		warn "retry already pending for $server, skipping\n" if $self->{debug};
+		return 1;
 	}
 
+	# ok, schedule the timer to re-check. this should NOT be a
+	# recurring timer, otherwise we end up with a bunch of pending
+	# retries since the "interval" is likely shorter than TCP timeout.
+	# eventually this will error out, in which case we'll try it again
+	# by calling markServerDown() after clearying retry_pending, or
+	# it'll work and we're good to go.
+	my $t;
+	my $r;
+	$t = AnyEvent->timer(
+		after => $delay,
+		cb => sub {
+			warn "timer callback triggered for $server" if $self->{debug};
+			my ($host, $port) = split /:/, $server;
+			print "attempting reconnect to $server\n" if $self->{debug};
+			$r = AnyEvent::Redis->new(
+				host => $host,
+				port => $port,
+				on_error => sub {
+					warn @_ unless $self->{quiet};
+					$self->{server_status}{"$server:retry_pending"} = 0;
+					$self->markServerDown($server); # schedule another try
+				}
+			);
+
+			$r->ping(sub{
+				my $val = shift; # should be 'PONG'
+				if ($val ne 'PONG') {
+					warn "retry ping got $val instead of PONG" if $self->{debug};
+				}
+				$self->{conn}->{$server} = $r;
+				$self->{server_status}{"$server:retry_pending"} = 0;
+				$self->markServerUp($server);
+				undef $t; # we need to keep a ref to the timer here so it runs at all
+			 });
+		}
+	);
+	warn "scheduled health check of $server in $delay secs\n" if $self->{debug};
+	$self->{server_status}{"$server:retry_pending"} = 1;
 	return 1;
-}
-
-sub serverNeedsRetry {
-	my ($self, $server) = @_;
-
-	# if we haven't hit the max, yes
-	if ($self->{server_status}{"$server:retries"} < $self->{max_host_retries}) {
-		print "fast retry $server\n" if $self->{debug};
-		return 1;
-	}
-
-	# otherwise, assume we have and check time
-	if ((time() - $self->{server_status}{"$server:last_try"}) >= $self->{server_status}{"$server:retry_interval"}) {
-		#print "slow retry $server ($status->{$server:retry_interval})\n" if $self->{debug};
-		return 1;
-	}
-
-	# default, don't bother
-	return 0;
 }
 
 our $AUTOLOAD;
@@ -254,71 +294,44 @@ sub AUTOLOAD {
 		$_[0] = $key;
 	}
 
-	my $server = $self->keyToServer($hk);
-	print "server [$server] for key [$hk]\n" if $self->{debug};
+	my $node = $self->keyToNode($hk);
+	my $query_all = $self->{query_all};
 
-	my $r;
+	if ($call =~ s/_all$//) {
+		$query_all = 1;
+	}
 
-	# have a non-idle connection already?
-	if ($self->{conn}->{$server}) {
-		if ($self->{idle_timeout}) {
-			if ($self->{last_used}->{$server} > time - $self->{idle_timeout}) {
-				$r = $self->{conn}->{$server};
+	## The normal single-server case...
+	if (not $query_all) {
+		my $server = $self->nodeToHost($node);
+		print "server [$server] of node [$node] for key [$key] hashkey [$hk]\n" if $self->{debug};
+
+		if ($self->isServerDown($server)) {
+			# try another if we can
+			if ($self->{config}->{nodes}->{$node}->{addresses}) {
+				print "server [$server] seems down\n" if $self->{debug};
+				$server = $self->nextServer($server, $node);
+				print "trying next server in line [$server] for node [$node]\n" if $self->{debug};
+			}
+			# bail otherwise
+			else {
+				print "server $server down.  abandoning call.\n" if $self->{debug};
+				$cb->(undef);
+				return $self;
 			}
 		}
-		else {
-			$r = $self->{conn}->{$server};
+
+		return $self->scheduleCall($server, $call, [@_], $cb);
+	}
+
+	## Need to fire this one at all up servers in the node group...
+	else {
+		my $servers = $self->allServers($node);
+		for my $server (@$servers) {
+			$self->scheduleCall($server, $call, [@_], $cb);
 		}
+		return $self;
 	}
-	if (not defined $r) {
-		my ($host, $port) = split /:/, $server;
-		print "new to $server\n" if $self->{debug};
-		$r = AnyEvent::Redis->new(
-			host => $host,
-			port => $port,
-			on_error => sub {
-				warn @_;
-				#$self->{conn}->{$server} = undef;
-				$self->markServerDown($server);
-				$self->{cv}->end;
-			}
-		);
-
-		$self->{conn}->{$server} = $r;
-	}
-
-	if ($self->isServerDown($server) and not $self->serverNeedsRetry($server)) {
-		print "server $server down and not retrying...\n" if $self->{debug};
-		$cb->(undef);
-		#$self->{cv}->end;
-		return ();
-	}
-
-	if (not defined $self->{cv}) {
-		$self->{cv} = AnyEvent->condvar;
-	}
-
-	$self->{cv}->begin;
-	$self->{request_serial}++;
-	my $rid = $self->{request_serial};
-	$self->{request_state}->{$rid} = 1; # open request; 0 is cancelled
-	print "scheduling request $rid: $_[0]\n" if $self->{debug};
-
-	$r->$call(@_, sub {
-		if (not $self->{request_state}->{$rid}) {
-			print "call found request $rid cancelled\n" if $self->{debug};
-			delete $self->{request_state}->{$rid};
-			$self->markServerDown($server);
-			return;
-		}
-		$self->{cv}->end;
-		$self->markServerUp($server);
-		$self->{last_used}->{$server} = time;
-		print "callback completed for request $rid\n" if $self->{debug};
-		delete $self->{request_state}->{$rid};
-		$cb->(shift);
-	});
-	return $self;
 }
 
 sub poll {
@@ -326,13 +339,12 @@ sub poll {
 	#return if $self->{pending_requests} < 1;
 	return if not defined $self->{cv};
 	my $rid = $self->{request_serial};
-
 	my $timeout = $self->{command_timeout};
 
+	my $w;
 	if ($timeout) {
-		my $w;
-		$w = AnyEvent->signal (signal => "ALRM", cb => sub {
-			warn "AnyEvent::Redis::Federated::poll alarm timeout! ($rid)\n";
+		$w = AnyEvent->signal(signal => "ALRM", cb => sub {
+			warn "AnyEvent::Redis::Federated::poll alarm timeout! ($rid)\n" if $self->{debug};
 
 			# check the state of requests, marking remaining as cancelled
 			while (my ($rid, $state) = each %{$self->{request_state}}) {
@@ -351,6 +363,72 @@ sub poll {
 	$self->{cv}->recv;
 	$self->{cv} = undef;
 	alarm(0);
+	undef $w;
+}
+
+sub scheduleCall {
+	my ($self, $server, $call, $args, $cb) = @_;
+
+	# have a non-idle connection already?
+	my $r;
+	if ($self->{conn}->{$server}) {
+		if ($self->{idle_timeout}) {
+			if ($self->{last_used}->{$server} > time - $self->{idle_timeout}) {
+				$r = $self->{conn}->{$server};
+			}
+		}
+		else {
+			$r = $self->{conn}->{$server};
+		}
+	}
+
+	# otherwise create a new connection
+	if (not defined $r) {
+		my ($host, $port) = split /:/, $server;
+		print "attempting new connection to $server\n" if $self->{debug};
+		$r = AnyEvent::Redis->new(
+			host => $host,
+			port => $port,
+			on_error => sub {
+				warn @_ unless $self->{quiet};
+				$self->markServerDown($server);
+				$self->{cv}->end;
+			}
+		);
+
+		$self->{conn}->{$server} = $r;
+	}
+
+	if (not defined $self->{cv}) {
+		$self->{cv} = AnyEvent->condvar;
+	}
+
+	$self->{cv}->begin;
+	$self->{request_serial}++;
+	my $rid = $self->{request_serial};
+	$self->{request_state}->{$rid} = 1; # open request; 0 is cancelled
+	print "scheduling request $rid: $_[0]\n" if $self->{debug};
+
+	if ($call eq 'multi' or $call eq 'exec') {
+		@$args = (); # these don't really take args
+	}
+
+	$r->$call(@$args, sub {
+		if (not $self->{request_state}->{$rid}) {
+			print "call found request $rid cancelled\n" if $self->{debug};
+			delete $self->{request_state}->{$rid};
+			$self->markServerDown($server);
+			$cb->(undef);
+			return;
+		}
+		$self->{cv}->end;
+		$self->markServerUp($server);
+		$self->{last_used}->{$server} = time;
+		print "callback completed for request $rid\n" if $self->{debug};
+		delete $self->{request_state}->{$rid};
+		$cb->(shift);
+	});
+	return $self;
 }
 
 =head1 NAME
@@ -370,28 +448,28 @@ AnyEvent::Redis::Federated - Full-featured Async Perl Redis client
   # send a request with a callback
   $redis->get("foo1", sub {
     my $val = shift;
-    print "cb got: $val\n";
+    print "cb got: $val\n"; # should print "cb got: 1"
   });
   $redis->poll;
 
 =head1 DESCRIPTION
 
 This is a wrapper around AnyEvent::Redis which adds timeouts,
-connection retries, multi-machine cluster configuration
-(including consistent hashing), and other magic bits.
+connection retries, multi-machine cluster configuration (including
+consistent hashing), node groups, and other magic bits.
 
 =head2 HASHING AND SCALING
 
 Keys are run through a consistent hashing algorithm to map them to
 "nodes" which ultimately map to instances defined by back-end
-host:port entries.  For example, the C<redis_1> node may map to
-the host and port C<redis1.example.com:63791>, but that'll all be
+host:port entries.  For example, the C<redis_1> node may map to the
+host and port C<redis1.example.com:63791>, but that'll all be
 transparent to the user.
 
-However, there are features in Redis that are handy if you
-know a given set of keys lives on a single insance (a wildcard fetch
-like C<KEYS gmail*>, for example).  To facilitate that, you can specify
-a "key group" that will be hashed insead of hashing the key.
+However, there are features in Redis that are handy if you know a
+given set of keys lives on a single insance (a wildcard fetch like
+C<KEYS gmail*>, for example).  To facilitate that, you can specify a
+"key group" that will be hashed insead of hashing the key.
 
 For example:
 
@@ -479,12 +557,6 @@ behvaior (defaults listed in parens for each):
      base_retry_interval by on each subsequent failure in back-off
      mode
 
-   * retry_slop_secs (5) is used as the upper bound on a whole number
-     of seconds to add to the retry_interval after each failure that
-     triggers an increase in the retry interval.  This parameter helps
-     to slightly stagger retry times between many clients on different
-     servers.
-
    * max_retry_interval (600) is the number of seconds that the retry
      interval will not exceed
 
@@ -507,28 +579,7 @@ about the down server.
 
 =head2 TIMEOUTS
 
-This module provides support for connection timeouts and command
-timeouts.  A connection timeout applies to the time required to
-establish a connection to a Redis server.  Generally speaking, that's
-only a problem if there are network problems preventing you from
-getting a positive or negative response from the server.  In normal
-circumstances, you'll either connect or be refused almost immediately.
-
-By default C<connect_timeout> is 1 second.  You can set it to
-whatever you like when creating a new AnyEvent::Redis::Federated object.
-Using 0 will have the effect of falling back to the OS default timeout.
-You may use floating-point (non-integer values) such as 0.5 for the
-connection timeout.  You can get or set the current connect_timeout by
-calling the C<connect_timeout()> method on an AnyEvent::Redis::Federated
-object.
-
-When a connect timeout is hit, the logic in CONNECTION RETRIES (above)
-kicks in.
-
-IMPORTANT: In high-volume contexts, such as running under
-Apache/mod_perl handling hundreds of requests per server per second,
-USE CARE to choose a wise value!  It's not unreasonable to use 100ms
-(0.1 seconds).
+This module provides support for command timeouts.
 
 The command timeout controls how long we're willing to wait for a
 response to a given request made to a Redis server.  Redis usually
@@ -586,12 +637,6 @@ looks like:
       redis_3 => { address => 'db2:63790' },
       redis_4 => { address => 'db2:63791' },
     },
-    'master_of' => {
-      'db1:63792' => 'db2:63790',
-      'db1:63793' => 'db2:63791',
-      'db2:63792' => 'db1:63790',
-      'db2:63793' => 'db1:63791',
-    },
   };
 
 The "nodes" and "master_of" hashes are described below.
@@ -599,26 +644,18 @@ The "nodes" and "master_of" hashes are described below.
 =head3 NODES
 
 The "nodes" configuation maps an arbitrary node name to a host:port
-pair.
+pair.  (The hostname can be replaced with an IP address.)
 
 Node names (redis_N in the example above) are VERY important since
 they are the keys used to build the consistent hashing ring. It's
 generally the wrong idea to change a node name. Since node names are
-mapped to a host:port pair, we can move a node from one host to another
-without rehashing a bunch of keys.
+mapped to a host:port pair, we can move a node from one host to
+another without rehashing a bunch of keys.
 
 There is unlikely to be a need to remove a node.
 
 Adding nodes to a cluster is currently not well-supported, but is an
-area of active development. 
-
-=head3 MASTER_OF
-
-The C<master_of> configuration describes the replication structure of the
-cluster. Replication provides us with a hot standby in case a machine
-fails. This structure tells a slave node which node is its master. If
-there is no mapping for a given host, it's a master. The format is
-'slave' => 'master'.
+area of active development.
 
 =head2 EVENT LOOP
 
@@ -655,13 +692,17 @@ that to AnyEvent.
 
 =head2 BUGS
 
-This code is lightly tested and considered to be of beta quality.
+Please report bugs as issues on github:
+
+  https://github.com/craigslist/perl-AnyEvent-Redis-Federated/issues
 
 =head1 AUTHOR
 
 Jeremy Zawodny, E<lt>jzawodn@craigslist.orgE<gt>
 
 Joshua Thayer, E<lt>joshua@craigslist.orgE<gt>
+
+Tyle Phelps, E<lt>tyler@craigslist.orgE<gt>
 
 =head1 COPYRIGHT AND LICENSE
 
